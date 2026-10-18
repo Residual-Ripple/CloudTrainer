@@ -1,0 +1,78 @@
+# 计划书 → 实现对照
+
+《计划书.md》里的每个条目在本项目里的落点。**这是交接时最先看的一页。**
+
+## 目标能力
+
+| # | 能力 | 实现位置 | 与计划书的差异 |
+|---|---|---|---|
+| G1 | 广播窗口化 | `WindowFixer`（Guards.cpp） | 用 `SWP_NOSENDCHANGING` 而不是每 800ms 硬顶；L2（注入子类化）**未实现**，见下 |
+| G2 | 黑屏压制 | `BlackGuard`（Guards.cpp） | 加了速率退避（>20 次/分钟退到 1s），计划书的风险 R6 |
+| G3 | 键盘解锁 | `InputUnlocker::Tick` | 同计划：结束 `PDelKeyB.exe` |
+| G4 | 鼠标解锁 | `InputUnlocker::QuitHookThreads` | **换了手段**：不注入调 `Lock(FALSE)`，改为给锁线程投 `WM_QUIT`。见下 |
+| G5 | 拦截结束请求 | 载荷 `DetTerminateProcess`（hooks.cpp） | **换了层次**：IAT hook 而不是 inline hook；判定从"pid 名单"扩到"非厂商用户程序" |
+| G6 | 远程命令闸门 | 载荷 `DetCreateProcess*/DetWinExec/DetShellExecuteEx*` + `Ui::ShowGate` | 同上；裁决窗是独立小窗，不是模态框 |
+| G7 | 紧急热键 | `MsgProc` WM_HOTKEY + `Ui::ShowFakeBlack` | 同计划 |
+| G8 | 托盘 + 状态窗 | `Ui`（Ui.cpp） | 图标运行期用 GDI 画，不依赖资源编译器 |
+| G9 | 单文件发行 | `build.py` + `LoadEmbeddedPayload` | 用"尾部追加 + CRC footer"代替 RCDATA（没有 rc.exe） |
+
+## 两处最重要的改动（以及为什么）
+
+### 1. G4 不再注入，改成"给锁线程投 WM_QUIT"
+
+计划书假设 `HookLib!Lock(FALSE)` 是解锁入口。反汇编后发现 **`Lock(0)` 直接 return，什么都不做**：
+
+```
+Lock: cmp [esp+4],0 ; je end ; CreateThread(...) ; end: ret
+```
+
+真正的清理在锁线程自己的析构路径里（`GetMessage` 返回 0 → `UnhookWindowsHookEx` → 置空 `g_hHook`）。
+所以实现改成：枚举目标进程线程 → `NtQueryInformationThread(9)` 取起始地址 → 落在 `HookLib` 模块范围内
+的就是锁线程 → `PostThreadMessage(tid, WM_QUIT)`。
+
+好处：不需要注入、不受调用约定影响、走的是厂商自己的代码路径。
+`HookLib!Lock` 仍然保留在载荷里作兜底（`DoUnlockMouse` 先直接 `UnhookWindowsHookEx(g_hHook)`）。
+
+### 2. G5/G6 用 IAT hook，不用 inline hook
+
+计划书写的是 mhook + disasm-lib。实际实现改成 IAT hook，理由：
+
+- inline hook 要改写函数序言，需要指令长度反汇编器；算错一个字节就是目标进程崩溃；
+- IAT hook 只改导入表里的一个指针，恢复就是写回原值；
+- 厂商是常规 C++ 静态导入，IAT 覆盖得到。
+
+代价写在 README 的已知限制里：厂商若改用 `GetProcAddress` 动态解析，这一层失效（不崩，只是不生效）。
+
+## 模块对照
+
+| 计划书模块 | 实现 | 说明 |
+|---|---|---|
+| M0 App | `CtMain.cpp` | 提权改成"运行时 runas 重启"，不依赖 manifest（没有 rc 编译器）；单实例仍是命名事件 |
+| M1 Locator | `Locator`（Core.cpp） | 增加"从安装目录的 exe 名单推候选进程"，避免全系统扫模块 |
+| M2 WindowFixer | `WindowFixer`（Guards.cpp） | 仅 L1 |
+| M3 BlackScreenGuard | `BlackGuard` | — |
+| M4 InputUnlocker | `InputUnlocker` | 见上 |
+| M5 Injector / IpcServer | `Inject.cpp` + `Reflect.cpp` | 反射加载器独立成模块，可单测 |
+| M6 Payload | `src/payload/*` | 不用 CRT；IAT hook；共享内存 IPC |
+| M7 Hotkey / Emergency | `MsgProc` + `App::RestoreAll` | 全部还原会**同时关掉所有能力**，否则 5 秒后策略又把注入装回去 |
+| M8 TrayApp | `Ui` | 原生 Win32 |
+| M9 VersionGuard | `VersionGuard` | 指纹 = size + PE TimeDateStamp，全部实测值 |
+
+## 没做的
+
+| 项 | 原因 |
+|---|---|
+| L2 窗口子类化（注入 `MultiRender.exe` 吞掉全屏 `SetWindowPos`） | L1 的 `SWP_NOSENDCHANGING` 已能挡住大部分回弹；L2 要在广播进程里跑代码，风险与收益不成比例。若真机上出现反复回弹，再加 |
+| 计划书 4.3 的分频预算（300/800/2000/5000ms） | 统一收敛到 250ms 心跳 + 各模块内部节流（`PidsWithModule` 2s 缓存、`FindInstallDir` 10s 缓存、鼠标解锁 600ms 节流），实测 CPU 占用可以忽略 |
+| `--restore` 命令行 | 没有需要持久化的东西（不写注册表、不改配置），"还原"就是关掉能力 + 卸 hook，做成按钮比做成命令行更合理 |
+| 驱动 / 反监视 / UDP 重放 / 更新器 | 计划书的非目标 N1–N10，一致 |
+
+## 新增的东西（计划书里没有的）
+
+| 项 | 为什么加 |
+|---|---|
+| `Reflect.cpp` + `tests/` | 注入是最容易出错的一环，必须能单独测。测试抓到了白名单数组越界的致命 bug |
+| `tools/inspect.py` / `tools/check_imports.py` | 产物自检；后者证明了"转发导出"不是理论问题（42/72） |
+| `rep.gateCalls` 等诊断计数 | 没有它就无法判断"IAT hook 到底有没有被调用" |
+| 载荷里 `SafeRead` / `ClearHookHandle` | 载荷跑在别人家里，任何野指针都会让目标进程消失；读写 `g_hHook` 前先 `VirtualQuery` |
+| `protectUserApps` 开关 | 计划书的 G5 只保护固定 pid，挡不住教师端"关闭某个应用"；扩成"非厂商、非系统的用户程序" |
