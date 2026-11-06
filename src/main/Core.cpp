@@ -5,6 +5,7 @@
 #include "Core.h"
 
 #include <winreg.h>
+#include <aclapi.h>
 #include <algorithm>
 #include <cstdarg>
 #include <cstring>
@@ -150,6 +151,130 @@ bool IsElevated() {
     BOOL ok = GetTokenInformation(tok, TokenElevation, &el, sizeof(el), &sz);
     CloseHandle(tok);
     return ok && el.TokenIsElevated != 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  自我保护：给"本进程对象"加一条 DENY ACE，拒绝当前用户 PROCESS_TERMINATE。
+//
+//  能挡住什么：Student.exe / ProcessProtect.exe 这类以**同一个用户身份**运行的
+//            杀进程逻辑（TerminateProcess、taskkill /f 都要这个权限）。
+//  挡不住什么：SYSTEM 权限的杀进程、驱动层、Job Object 的
+//            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE。
+//  不影响：自己退出（我们走消息循环，不调 TerminateProcess）。
+// ─────────────────────────────────────────────────────────────────────────────
+namespace {
+
+bool CurrentUserSid(std::vector<uint8_t>* out) {
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
+    DWORD len = 0;
+    GetTokenInformation(tok, TokenUser, nullptr, 0, &len);
+    std::vector<uint8_t> buf(len ? len : 256);
+    if (!GetTokenInformation(tok, TokenUser, buf.data(), (DWORD)buf.size(), &len)) {
+        CloseHandle(tok);
+        return false;
+    }
+    auto* tu = reinterpret_cast<TOKEN_USER*>(buf.data());
+    const DWORD sidLen = GetLengthSid(tu->User.Sid);
+    out->resize(sidLen);
+    const bool ok = CopySid(sidLen, out->data(), tu->User.Sid) != FALSE;
+    CloseHandle(tok);
+    return ok;
+}
+
+bool DenyTerminateOn(HANDLE proc, const std::vector<uint8_t>& sid, std::wstring* why) {
+    PACL oldAcl = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (GetSecurityInfo(proc, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION,
+                        nullptr, nullptr, &oldAcl, nullptr, &sd) != ERROR_SUCCESS) {
+        if (why) *why = Fmt(L"GetSecurityInfo err=%lu", GetLastError());
+        return false;
+    }
+
+    EXPLICIT_ACCESSW ea{};
+    ea.grfAccessPermissions = PROCESS_TERMINATE;
+    ea.grfAccessMode = DENY_ACCESS;
+    ea.grfInheritance = NO_INHERITANCE;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_USER;
+    ea.Trustee.ptstrName = reinterpret_cast<LPWSTR>(const_cast<uint8_t*>(sid.data()));
+
+    PACL newAcl = nullptr;
+    bool ok = false;
+    if (SetEntriesInAclW(1, &ea, oldAcl, &newAcl) == ERROR_SUCCESS && newAcl) {
+        ok = SetSecurityInfo(proc, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION,
+                             nullptr, nullptr, newAcl, nullptr) == ERROR_SUCCESS;
+        if (!ok && why) *why = Fmt(L"SetSecurityInfo err=%lu", GetLastError());
+        LocalFree(newAcl);
+    } else if (why) {
+        *why = Fmt(L"SetEntriesInAcl err=%lu", GetLastError());
+    }
+    if (sd) LocalFree(sd);
+    return ok;
+}
+
+bool IsVendorName(const std::wstring& exe) {
+    for (int i = 0; target::kVendorExeWhitelist[i]; ++i) {
+        if (_wcsicmp(exe.c_str(), target::kVendorExeWhitelist[i]) == 0) return true;
+    }
+    for (int i = 0; target::kVendorGuardExe[i]; ++i) {
+        if (_wcsicmp(exe.c_str(), target::kVendorGuardExe[i]) == 0) return true;
+    }
+    return false;
+}
+
+} // namespace
+
+bool HardenSelf(std::wstring* why) {
+    std::vector<uint8_t> sid;
+    if (!CurrentUserSid(&sid)) {
+        if (why) *why = L"取不到当前用户 SID";
+        return false;
+    }
+    return DenyTerminateOn(GetCurrentProcess(), sid, why);
+}
+
+// 给"别人"也上锁：上课清理进程时，被清理的程序会拿到 ACCESS_DENIED。
+// 只处理"非厂商、非系统、非安装目录"的进程；需要 WRITE_DAC（管理员）。
+int ShieldApps(Locator& loc, const std::wstring& installDir, std::set<DWORD>& done) {
+    std::vector<uint8_t> sid;
+    if (!CurrentUserSid(&sid)) return 0;
+
+    wchar_t win[MAX_PATH]{};
+    const UINT winLen = GetWindowsDirectoryW(win, MAX_PATH);
+    if (winLen == 0 || winLen >= MAX_PATH) return 0;
+
+    loc.Refresh(false);
+    const DWORD self = GetCurrentProcessId();
+    int newly = 0;
+
+    for (const auto& p : loc.Procs()) {
+        if (!p.pid || p.pid == self || p.pid <= 4) continue;
+        if (done.count(p.pid)) continue;
+        if (done.size() > 512) done.clear();          // 防止无限增长
+        if (IsVendorName(p.exe)) { done.insert(p.pid); continue; }
+
+        HANDLE h = OpenProcess(WRITE_DAC | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, p.pid);
+        if (!h) { done.insert(p.pid); continue; }
+
+        wchar_t path[MAX_PATH * 2]{};
+        DWORD sz = MAX_PATH * 2;
+        const bool gotPath = QueryFullProcessImageNameW(h, 0, path, &sz) != FALSE;
+        const bool skip = !gotPath ||
+                          _wcsnicmp(path, win, winLen) == 0 ||
+                          (!installDir.empty() && _wcsnicmp(path, installDir.c_str(), installDir.size()) == 0);
+        if (skip) {
+            CloseHandle(h);
+            done.insert(p.pid);
+            continue;
+        }
+
+        std::wstring why;
+        if (DenyTerminateOn(h, sid, &why)) ++newly;
+        CloseHandle(h);
+        done.insert(p.pid);
+    }
+    return newly;
 }
 
 bool EnablePrivilege(const wchar_t* name) {
@@ -505,6 +630,12 @@ void Settings::Load(const std::wstring& path) {
         else if (k == L"autoInject")     autoInject = ParseBool(v, autoInject);
         else if (k == L"installDir")     installDirHint = v;
         else if (k == L"startupEnableAll") startupEnableAll = ParseBool(v, startupEnableAll);
+        else if (k == L"selfProtect")      selfProtect = ParseBool(v, selfProtect);
+        else if (k == L"strictVersion")    strictVersion = ParseBool(v, strictVersion);
+        else if (k == L"appShield")        appShield = ParseBool(v, appShield);
+        else if (k == L"netGuard")         netGuard = ParseBool(v, netGuard);
+        else if (k == L"netKillLimit")     netKillLimit = ParseBool(v, netKillLimit);
+        else if (k == L"netStopDriver")    netStopDriver = ParseBool(v, netStopDriver);
     }
     if (fixWidth < 320) fixWidth = 320;
     if (fixHeight < 240) fixHeight = 240;
@@ -530,7 +661,19 @@ void Settings::Save(const std::wstring& path) const {
     t += L"# CloudTrainer 配置\r\n";
     t += L"# 改完保存后，重启本程序生效。\r\n\r\n";
     t += L"# 启动时默认开启全部能力（1=开，0=按下面的开关来）\r\n";
-    t += Fmt(L"startupEnableAll=%d\r\n\r\n", startupEnableAll ? 1 : 0);
+    t += Fmt(L"startupEnableAll=%d\r\n", startupEnableAll ? 1 : 0);
+    t += L"# 自我保护：拒绝其它进程结束本程序（DACL 拒绝 PROCESS_TERMINATE）\r\n";
+    t += Fmt(L"selfProtect=%d\r\n", selfProtect ? 1 : 0);
+    t += L"# 严格版本校验：1=指纹不匹配就降只读；0=照常启用，仅标注未验证\r\n";
+    t += Fmt(L"strictVersion=%d\r\n", strictVersion ? 1 : 0);
+    t += L"# 给所有非厂商用户程序加一条 DACL，拒绝别人结束它们（上课清理进程时保命）\r\n";
+    t += Fmt(L"appShield=%d\r\n", appShield ? 1 : 0);
+    t += L"# 设备层：拒绝打开 \\\\.\\Inspect，并拒绝对它的 DeviceIoControl\r\n";
+    t += Fmt(L"netGuard=%d\r\n", netGuard ? 1 : 0);
+    t += L"# 发现 mmcLimitConsole（网络限制执行器）直接结束，不走弹窗\r\n";
+    t += Fmt(L"netKillLimit=%d\r\n", netKillLimit ? 1 : 0);
+    t += L"# 额外停掉 Inspect 驱动服务：更彻底，但会影响所有依赖它的功能，默认关\r\n";
+    t += Fmt(L"netStopDriver=%d\r\n\r\n", netStopDriver ? 1 : 0);
     t += L"# ── 广播窗口化 ──\r\n";
     t += Fmt(L"fixBroadcast=%d\r\n", fixBroadcast ? 1 : 0);
     t += Fmt(L"fixWidth=%d\r\n", fixWidth);
@@ -824,13 +967,20 @@ const wchar_t* EnvLevelName(EnvLevel lv) {
 }
 
 void VersionGuard::Evaluate(const std::wstring& dir) {
+    dir_ = dir;
     if (dir.empty()) {
         level_ = EnvLevel::Unknown;
         detail_ = L"未找到安装目录";
         return;
     }
+    // 产品在不在，只看主程序有没有。指纹只是"是不是我验证过的那版"，不是"能不能用"。
+    if (!FileExists(dir + L"\\" + target::kProcStudent)) {
+        level_ = EnvLevel::ReadOnly;
+        detail_ = L"目录里没有 Student.exe";
+        return;
+    }
+
     int matched = 0, total = 0;
-    bool criticalOk = true;
     std::wstring miss;
 
     for (int i = 0; i < target::kFingerprintCount; ++i) {
@@ -843,19 +993,22 @@ void VersionGuard::Evaluate(const std::wstring& dir) {
         } else {
             if (!miss.empty()) miss += L", ";
             miss += fp.file;
-            if (fp.critical) criticalOk = false;
         }
     }
 
+    // 指纹只回答"是不是我逐字节验证过的那一版"，不回答"能不能用"。
+    // 原来的规则是"主链不匹配就降只读"，那会让换一个维护版本就整体罢工（G2–G6 全关），
+    // 而 G1 仍然工作 —— 这种"半死不活"的状态最难排查，所以改成降级但仍全功能，
+    // 只在界面上标注"版本未验证"。要旧行为把 strictVersion 设成 1。
     if (matched == total) {
         level_ = EnvLevel::Full;
         detail_ = Fmt(L"%d/%d 指纹匹配", matched, total);
-    } else if (criticalOk) {
-        level_ = EnvLevel::Degraded;
-        detail_ = Fmt(L"%d/%d 匹配，未匹配：%s", matched, total, miss.c_str());
-    } else {
+    } else if (strictVersion) {
         level_ = EnvLevel::ReadOnly;
-        detail_ = Fmt(L"%d/%d 匹配，主链不匹配：%s", matched, total, miss.c_str());
+        detail_ = Fmt(L"%d/%d 匹配，严格模式下拒绝运行：%s", matched, total, miss.c_str());
+    } else {
+        level_ = EnvLevel::Degraded;
+        detail_ = Fmt(L"%d/%d 匹配（版本未验证，功能照常启用）：%s", matched, total, miss.c_str());
     }
 }
 

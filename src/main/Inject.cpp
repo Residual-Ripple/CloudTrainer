@@ -61,7 +61,8 @@ void IpcSession::RequestUnlock() {
     InterlockedIncrement(&shm_->req.seqUnlock);
 }
 
-void IpcSession::PushPolicy(const Settings& cfg, const std::vector<DWORD>& protect) {
+void IpcSession::PushPolicy(const Settings& cfg, const std::vector<DWORD>& protect,
+                            const std::wstring& vendorDir) {
     if (!shm_) return;
     CtReq* r = &shm_->req;
     r->wantTerminateGuard = cfg.blockTerminate ? 1 : 0;
@@ -69,7 +70,16 @@ void IpcSession::PushPolicy(const Settings& cfg, const std::vector<DWORD>& prote
     r->wantCmdGate = cfg.cmdGate ? 1 : 0;
     r->cmdGateTimeoutMs = cfg.cmdGateTimeout * 1000;
     r->protectAllUserApps = cfg.protectUserApps ? 1 : 0;
+    r->wantNetGuard = cfg.netGuard ? 1 : 0;
     r->unlockHoldMs = 3000;
+
+    // 安装目录下的一切 = 广播流水线。载荷用它做“主动放行”的兜底。
+    {
+        int n = (int)vendorDir.size();
+        if (n > 259) n = 259;
+        for (int i = 0; i < n; ++i) r->vendorDir[i] = vendorDir[i];
+        r->vendorDir[n] = 0;
+    }
 
     int n = (int)protect.size();
     if (n > CT_MAX_PROTECT_PIDS) n = CT_MAX_PROTECT_PIDS;
@@ -128,7 +138,14 @@ void Injector::Ensure(DWORD pid) {
     if (!started_ || !pid || pid == GetCurrentProcessId()) return;
     EnterCriticalSection(&cs_);
     bool have = sessions_.find(pid) != sessions_.end();
-    if (!have) queue_.insert(pid);
+    if (!have) {
+        // 已经注入过、只是会话还没建好（或者被旧载荷占了映射）时不要再注入：
+        // 反射映射每次都会新建一条载荷线程，反复注入等于线程泄漏。
+        auto it = injectedAt_.find(pid);
+        const uint64_t now = NowMs();
+        const bool recentlyInjected = (it != injectedAt_.end() && now - it->second < 20000);
+        if (!recentlyInjected) queue_.insert(pid);
+    }
     LeaveCriticalSection(&cs_);
     if (wake_) SetEvent(wake_);
 }
@@ -158,6 +175,13 @@ void Injector::PruneDead() {
             it->second->RequestShutdown();
             delete it->second;
             sessions_.erase(it);
+        }
+    }
+    if (!dead.empty()) {
+        for (DWORD pid : dead) {
+            bases_.erase(pid);
+            injectedAt_.erase(pid);
+            failedAt_.erase(pid);
         }
     }
     LeaveCriticalSection(&cs_);
@@ -217,6 +241,7 @@ bool Injector::InjectNow(DWORD pid, std::wstring* err) {
     if (ok) {
         EnterCriticalSection(&cs_);
         bases_[pid] = base;
+        injectedAt_[pid] = NowMs();
         LeaveCriticalSection(&cs_);
         InterlockedIncrement(&injectedCount_);
         A().log.Info(L"注入成功 pid=%lu base=0x%08lx", pid, base);
@@ -340,9 +365,10 @@ void Injector::RequestUnlockAll() {
     LeaveCriticalSection(&cs_);
 }
 
-void Injector::PushPolicy(const Settings& cfg, const std::vector<DWORD>& protect) {
+void Injector::PushPolicy(const Settings& cfg, const std::vector<DWORD>& protect,
+                          const std::wstring& vendorDir) {
     EnterCriticalSection(&cs_);
-    for (auto& kv : sessions_) kv.second->PushPolicy(cfg, protect);
+    for (auto& kv : sessions_) kv.second->PushPolicy(cfg, protect, vendorDir);
     LeaveCriticalSection(&cs_);
 }
 
@@ -385,11 +411,37 @@ std::vector<Injector::Stat> Injector::Snapshot() {
             s.blockedClose = shm->rep.blockedClose;
             s.gated = shm->rep.gatedCmd;
             s.unlockCalls = shm->rep.unlockCalls;
+            s.devBlocked = shm->rep.devBlocked;
+            s.inprocUnlocks = shm->rep.inprocUnlocks;
+            s.ioctlBlocked = shm->rep.ioctlBlocked;
+            s.deniedLaunch = shm->rep.deniedLaunch;
         }
         out.push_back(s);
     }
     LeaveCriticalSection(&cs_);
     return out;
+}
+
+bool Injector::AnyMouseHook() {
+    bool any = false;
+    EnterCriticalSection(&cs_);
+    for (auto& kv : sessions_) {
+        CtShared* shm = kv.second->Shm();
+        if (shm && shm->rep.mouseHook != 0) { any = true; break; }
+    }
+    LeaveCriticalSection(&cs_);
+    return any;
+}
+
+std::wstring Injector::LastBlockedName() {
+    std::wstring name;
+    EnterCriticalSection(&cs_);
+    for (auto& kv : sessions_) {
+        CtShared* shm = kv.second->Shm();
+        if (shm && shm->rep.lastTermName[0]) { name = shm->rep.lastTermName; break; }
+    }
+    LeaveCriticalSection(&cs_);
+    return name;
 }
 
 std::wstring Injector::LastError() {

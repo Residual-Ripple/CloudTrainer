@@ -170,7 +170,15 @@ bool App::Init() {
     loc.Refresh(true);
     std::wstring dir;
     loc.FindInstallDir(&dir, true);
+    ver.SetStrict(cfg.strictVersion);
     ver.Evaluate(dir);
+
+    // 自我保护：先把自己变成"杀不掉"，再去动别人的进程
+    if (cfg.selfProtect) {
+        std::wstring why;
+        if (HardenSelf(&why)) log.Info(L"自我保护：已启用（外部 TerminateProcess 会被拒绝）");
+        else log.Warn(L"自我保护：启用失败 %s", why.c_str());
+    }
 
     log.Info(L"数据目录：%s", dataDir.c_str());
     log.Info(L"安装目录：%s", dir.empty() ? L"(未找到)" : dir.c_str());
@@ -209,6 +217,17 @@ bool App::Init() {
     nextPolicy_ = now;
     policyDirty_ = true;
 
+    // 后手启动：此时锁可能已经在生效，用户没有可用的键鼠去点任何东西。
+    // 所以在进入消息循环之前先同步抢一次，不依赖任何界面交互。
+    if (cfg.unlockKeyboard || cfg.unlockMouse) {
+        UnlockControlNow(false);
+    }
+
+    // 后手启动的另一种情形：广播已经开始了。先无条件扫一遍窗口，
+    // 不等第一个 250ms 定时器 —— “没有出现广播窗口”有一半是启动时机问题。
+    fixer.Tick(cfg, cfg.fixBroadcast);
+    NetGuardTick(true, NowMs());
+
     log.Info(L"启动完成，%s", IsElevated() ? L"管理员权限" : L"普通权限（部分能力不可用）");
     return true;
 }
@@ -233,17 +252,76 @@ void App::Tick() {
         ver.Evaluate(dir);
     }
 
-    const bool readOnly = ver.Level() == EnvLevel::ReadOnly;
+    // 只有"产品不在 / 严格模式拒绝"才停手；降级模式照常工作
+    const bool operational = (ver.Level() == EnvLevel::Full || ver.Level() == EnvLevel::Degraded);
+    const bool readOnly = !operational;
 
     black.Tick(cfg.killBlackScreen && !readOnly);
     input.Tick(cfg, loc, cfg.unlockKeyboard && !readOnly, cfg.unlockMouse && !readOnly);
     fixer.Tick(cfg, cfg.fixBroadcast);
+    NetGuardTick(operational, now);
 
-    // 只有需要“注入类能力”时才注入；只做窗口/黑屏/键盘时完全不碰目标进程
-    const bool needHooks = cfg.blockTerminate || cfg.blockClose || cfg.cmdGate;
-    if (cfg.autoInject && !readOnly && needHooks) {
-        for (DWORD pid : loc.PidsByExe(target::kProcStudent)) inj.Ensure(pid);
-        for (DWORD pid : loc.PidsWithModule(target::kModHookLib)) inj.Ensure(pid);
+    // ── 解锁的两条腿 ────────────────────────────────────────────────────────
+    // 1) 发现"新的锁"（上课开始 / 中途重新上锁）就立刻抢，不等 500ms 节流；
+    // 2) 外部通道不可靠时，让载荷在进程内 UnhookWindowsHookEx —— 这条不依赖
+    //    线程起始地址、也不依赖目标线程有消息队列，是后手启动时的主路径。
+    if (operational && (cfg.unlockKeyboard || cfg.unlockMouse)) {
+        std::set<DWORD> hosts;
+        if (cfg.unlockMouse) {
+            for (DWORD p : loc.PidsWithModule(target::kModHookLib)) hosts.insert(p);
+        }
+        if (hosts != lockHosts_) {
+            // 只有"出现了新的宿主 pid"才算重新上锁；宿主消失不用抢
+            bool newHost = false;
+            for (DWORD p : hosts) {
+                if (!lockHosts_.count(p)) { newHost = true; break; }
+            }
+            lockHosts_ = hosts;
+            if (newHost) {
+                lastLockSeen_ = now;
+                log.Info(L"检测到新的鼠标锁宿主（%d 个进程），立即解锁", (int)hosts.size());
+                UnlockControlNow(false);
+            }
+        }
+        // 进程内解锁请求的节奏：
+        //   urgent  —— 刚注入成功 / 外部看到了锁线程 / rep.mouseHook != 0，1 秒一次；
+        //   普通    —— 目标进程里只是加载了 HookLib（可能还没上锁），2.5 秒一次兜底。
+        // 后者是为了"看不懂的版本"：RVA 和线程特征都可能变，但进程内 Unhook 这条路
+        // 只要 g_pHook 还能读到就有效，读不到也就安静地什么都不做。
+        const size_t sess = inj.SessionCount();
+        const bool freshSession = (sess != lastSessionCount_);
+        lastSessionCount_ = sess;
+        const bool urgent = freshSession || input.MouseHookPresent() || inj.AnyMouseHook();
+        if (cfg.unlockMouse && (urgent || input.HasLockHost()) && now >= nextInProc_) {
+            nextInProc_ = now + (urgent ? 1000 : 2500);
+            inj.RequestUnlockAll();
+        }
+    }
+
+    // 注入目标分两类：
+    //   * Student.exe / HookLib 宿主 —— 装 IAT hook（G5/G6）
+    //   * MultiRender.exe          —— 窗口守卫（对付它自己抢回全屏/置顶/隐藏光标）
+    const bool needHooks = cfg.blockTerminate || cfg.blockClose || cfg.cmdGate || cfg.netGuard;
+    if (cfg.autoInject && operational && (needHooks || cfg.fixBroadcast)) {
+        if (needHooks) {
+            // 执行"程序使用限制 / 网络使用限制"的不止 Student.exe ——
+            // ProcessProtect / Loader / Multi 也都导入了枚举+TerminateProcess，
+            // 所以这一族全部注入。
+            for (int i = 0; target::kVendorGuardExe[i]; ++i) {
+                for (DWORD pid : loc.PidsByExe(target::kVendorGuardExe[i])) inj.Ensure(pid);
+            }
+            for (DWORD pid : loc.PidsWithModule(target::kModHookLib)) inj.Ensure(pid);
+        }
+        if (cfg.fixBroadcast) {
+            for (DWORD pid : loc.PidsByExe(target::kProcMultiRender)) inj.Ensure(pid);
+        }
+    }
+
+    // 给"别人"上锁：每 3 秒把新出现的用户程序也保护起来
+    if (cfg.appShield && operational && now >= nextShield_) {
+        nextShield_ = now + 3000;
+        const int n = ShieldApps(loc, ver.InstallDir(), shieldedPids_);
+        if (n > 0) log.Info(L"已为 %d 个用户程序加上「拒绝结束」保护", n);
     }
 
     if (now >= nextBeat_) {
@@ -253,7 +331,7 @@ void App::Tick() {
     if (policyDirty_ || now >= nextPolicy_) {
         nextPolicy_ = now + 5000;
         policyDirty_ = false;
-        inj.PushPolicy(cfg, ProtectPids());
+        inj.PushPolicy(cfg, ProtectPids(), ver.InstallDir());
     }
 
     // 远程命令裁决
@@ -270,6 +348,7 @@ void App::Tick() {
         }
     }
 
+    ui.UpdateGate();
     ui.Update();
 }
 
@@ -317,6 +396,9 @@ void App::OnCommand(int id, int code) {
                 ShowStatus();
             }
             break;
+        case ID_TRAY_UNLOCK:
+            UnlockControlNow(true);
+            break;
         case ID_TRAY_RESTORE:
         case ID_BTN_RESTORE:
             RestoreAll(false);
@@ -363,6 +445,11 @@ void App::OnTray(UINT evt) {
 
 void App::ShowStatus() { ui.ShowStatus(); }
 
+void App::RequestQuit() {
+    // 关闭按钮 = 退出：先把改过的东西还回去，再结束消息循环
+    RestoreAll(true);
+}
+
 void App::RequestRestoreHotkey() {
     uint64_t now = NowMs();
     if (now < restoreConfirmUntil_) {
@@ -393,6 +480,84 @@ void App::DecideGate(int decision) {
     ui.HideGate();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  网络限制的反制
+//
+//  “网络使用限制”只有一个用户态入口：mmcLimitConsole_x64.exe 打开
+//  \\.\Inspect 并下发 WFP 过滤器。三条腿一起上，任何一条断了都还有别的：
+//    1) 命令闸门直接拒绝启动它（载荷里，命中名单立即返回 FALSE）；
+//    2) 这里每 2 秒扫一次，发现它就结束（防它被别的途径拉起 / 提前拉起）；
+//    3) 载荷 hook CreateFile / DeviceIoControl，拦住设备访问本身。
+//  第 3 条是关键：它同时覆盖“我们注入之前就已打开的老句柄”。
+// ─────────────────────────────────────────────────────────────────────────────
+void App::NetGuardTick(bool operational, uint64_t now) {
+    if (!cfg.netGuard || !operational || now < nextNet_) return;
+    nextNet_ = now + 2000;
+
+    if (cfg.netKillLimit) {
+        static const wchar_t* kNames[] = {
+            L"mmcLimitConsole_x64.exe", L"mmcLimitConsole_x86.exe", L"mmcLimitConsole.exe",
+        };
+        for (int i = 0; i < 3; ++i) {
+            for (DWORD pid : EnumPidsByName(kNames[i])) {
+                DWORD err = 0;
+                if (TerminatePid(pid, &err)) {
+                    ++netKills_;
+                    log.Info(L"已结束网络限制执行器 %s pid=%lu（累计 %d 次）", kNames[i], pid, netKills_);
+                } else if (err != ERROR_ACCESS_DENIED && err != ERROR_INVALID_PARAMETER) {
+                    log.Warn(L"结束 %s 失败 pid=%lu err=%lu", kNames[i], pid, err);
+                }
+            }
+        }
+    }
+
+    if (cfg.netStopDriver && now >= nextDriverStop_) {
+        nextDriverStop_ = now + 30000;
+        SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+        if (scm) {
+            SC_HANDLE svc = OpenServiceW(scm, L"Inspect", SERVICE_STOP | SERVICE_QUERY_STATUS);
+            if (svc) {
+                SERVICE_STATUS st{};
+                if (QueryServiceStatus(svc, &st) && st.dwCurrentState != SERVICE_STOPPED) {
+                    if (ControlService(svc, SERVICE_CONTROL_STOP, &st)) {
+                        if (!driverStopLogged_) {
+                            log.Info(L"已请求停止 Inspect 驱动服务");
+                            driverStopLogged_ = true;
+                        }
+                    } else if (!driverStopLogged_) {
+                        log.Warn(L"停止 Inspect 服务失败 err=%lu", GetLastError());
+                        driverStopLogged_ = true;
+                    }
+                }
+                CloseServiceHandle(svc);
+            }
+            CloseServiceHandle(scm);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  立即解除控制
+//
+//  这个函数刻意做成"不需要任何界面交互也能生效"：启动时、检测到新锁、
+//  托盘菜单、--unlock 命令行都走它。
+// ─────────────────────────────────────────────────────────────────────────────
+void App::UnlockControlNow(bool announce) {
+    loc.Refresh(true);
+    input.UnlockNow(loc, cfg.unlockKeyboard, cfg.unlockMouse);
+
+    // 进程内通道：注入还在排队时这里是空操作，之后 Tick 会继续补发
+    if (cfg.unlockMouse) inj.RequestUnlockAll();
+
+    const std::wstring st = input.StatusText();
+    log.Info(L"立即解锁：%s｜%s", st.c_str(), input.LastResult().c_str());
+    if (announce) {
+        std::wstring body = st;
+        if (!input.LastResult().empty()) body += L"\n" + input.LastResult();
+        Balloon(msgWnd, L"已尝试解除控制", body.c_str(), NIIF_INFO);
+    }
+}
+
 void App::RestoreAll(bool exitAfter) {
     if (quitting && !exitAfter) return;
     log.Info(L"开始全部还原（exit=%d）", exitAfter ? 1 : 0);
@@ -414,7 +579,7 @@ void App::RestoreAll(bool exitAfter) {
     fixer.RestoreAll();
 
     // 4) 通知载荷卸载全部 IAT 补丁并退出线程
-    inj.PushPolicy(cfg, ProtectPids());
+    inj.PushPolicy(cfg, ProtectPids(), ver.InstallDir());
     inj.ShutdownAll();
 
     log.Info(L"全部还原完成，所有能力已关闭");
@@ -438,15 +603,28 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    bool probe = false, noElevate = false;
+    bool probe = false, netprobe = false, unlockOnce = false, noElevate = false;
+    bool uiPreview = false, winList = false;
+    std::wstring uiPreviewDir;
     for (int i = 1; i < argc; ++i) {
         if (_wcsicmp(argv[i], L"--probe") == 0) probe = true;
+        else if (_wcsicmp(argv[i], L"--netprobe") == 0) netprobe = true;
+        else if (_wcsicmp(argv[i], L"--unlock") == 0) unlockOnce = true;
+        else if (_wcsicmp(argv[i], L"--winlist") == 0) winList = true;
+        else if (_wcsicmp(argv[i], L"--uipreview") == 0) {
+            uiPreview = true;
+            if (i + 1 < argc) uiPreviewDir = argv[++i];
+        }
         else if (_wcsicmp(argv[i], L"--no-elevate") == 0) noElevate = true;
         else if (_wcsicmp(argv[i], L"--elevated") == 0) noElevate = true;
     }
     if (argv) LocalFree(argv);
 
     if (probe) return RunProbe();
+    if (netprobe) return RunNetProbe();
+    if (unlockOnce) return RunUnlockOnce();
+    if (uiPreview) return RunUiPreview(uiPreviewDir.c_str());
+    if (winList) return RunWinList();
 
     if (!IsElevated() && !noElevate) {
         if (RelaunchElevated()) return 0;
@@ -465,7 +643,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     EnableDpiAwareness();
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
+    Gdiplus::GdiplusStartupInput gdiIn;
+    ULONG_PTR gdiToken = 0;
+    const bool gdiOk = Gdiplus::GdiplusStartup(&gdiToken, &gdiIn, nullptr) == Gdiplus::Ok;
+
     int rc = App::I().Run(hInst, nCmdShow);
+
+    if (gdiOk) Gdiplus::GdiplusShutdown(gdiToken);
     CoUninitialize();
     if (inst) CloseHandle(inst);
     return rc;

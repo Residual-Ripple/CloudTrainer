@@ -38,6 +38,7 @@
 #include <set>
 
 #include "TargetDefs.h"
+#include "UiTheme.h"
 #include "CtIpc.h"
 
 namespace ct {
@@ -46,7 +47,7 @@ namespace ct {
 //  常量 / 消息
 // ─────────────────────────────────────────────────────────────────────────────
 inline constexpr wchar_t kAppName[]    = L"CloudTrainer";
-inline constexpr wchar_t kAppVersion[] = L"1.0.0";
+inline constexpr wchar_t kAppVersion[] = L"1.4.0";
 inline constexpr wchar_t kInstanceEvent[] = L"Local\\CloudTrainer.Instance";
 
 enum : UINT {
@@ -59,6 +60,7 @@ enum : UINT {
 // 命令 id（托盘 / 窗口按钮）
 enum CmdId : int {
     ID_TRAY_STATUS = 100,
+    ID_TRAY_UNLOCK,          // 立即解除控制（键鼠）
     ID_TRAY_RESTORE,
     ID_TRAY_LOGDIR,
     ID_TRAY_ABOUT,
@@ -109,6 +111,9 @@ bool FileExists(const std::wstring& p);
 bool ReadAllBytes(const std::wstring& path, std::vector<uint8_t>* out);
 uint64_t NowMs();
 bool IsElevated();
+bool HardenSelf(std::wstring* why);   // DACL 拒绝 PROCESS_TERMINATE
+// 广播窗口判定（窗口修正与 --winlist 共用同一套规则）
+bool IsBroadcastWindowEx(HWND hwnd, RECT* monRect, std::wstring* why);
 bool EnablePrivilege(const wchar_t* name);
 bool IsProcessAlive(DWORD pid);
 std::wstring ProcessImagePath(DWORD pid);
@@ -174,6 +179,12 @@ struct Settings {
     // =1：每次启动都全开，运行时可以临时关，但重启后恢复全开；
     // =0：完全按 ini 里的开关来（关掉的就一直关着）。
     bool startupEnableAll = true;
+    bool selfProtect      = true;   // 拒绝其它进程结束自己
+    bool appShield        = true;   // 给所有非厂商用户程序加"禁止结束"的 DACL
+    bool netGuard         = true;   // 拒绝打开 \\.\Inspect / 拒绝其 IOCTL
+    bool netKillLimit     = true;   // 发现 mmcLimitConsole 直接结束（网络限制执行器）
+    bool netStopDriver    = false;  // 额外停掉 Inspect 驱动服务（更彻底，默认关）
+    bool strictVersion    = false;  // 1 = 指纹不符就降只读
 
     void Load(const std::wstring& path);
     void Save(const std::wstring& path) const;
@@ -220,6 +231,9 @@ private:
     uint64_t installStamp_ = 0;
 };
 
+// 给"别人"的进程也加一条 DENY PROCESS_TERMINATE（需要 WRITE_DAC）
+int ShieldApps(Locator& loc, const std::wstring& installDir, std::set<DWORD>& done);
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  VersionGuard —— 指纹比对与降级
 // ─────────────────────────────────────────────────────────────────────────────
@@ -228,13 +242,17 @@ const wchar_t* EnvLevelName(EnvLevel lv);
 
 class VersionGuard {
 public:
+    void SetStrict(bool s) { strictVersion = s; }
     void Evaluate(const std::wstring& installDir);
     EnvLevel Level() const { return level_; }
+    const std::wstring& InstallDir() const { return dir_; }
     std::wstring Detail() const { return detail_; }
     bool FullMode() const { return level_ == EnvLevel::Full; }
 private:
     EnvLevel level_ = EnvLevel::Unknown;
+    bool strictVersion = false;
     std::wstring detail_;
+    std::wstring dir_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -250,9 +268,11 @@ public:
 private:
     struct Track {
         HWND hwnd = nullptr;
-        int fixes = 0;
+        int fixes = 0;          // 尺寸纠正次数
+        int enforces = 0;       // 样式/置顶纠正次数
         uint64_t firstMs = 0;
         uint64_t lastMs = 0;
+        bool ncWarned = false;  // 是否已经提示过"非客户区被剥离"
     };
     struct TickCtx {
         WindowFixer* self = nullptr;
@@ -288,23 +308,36 @@ private:
 class InputUnlocker {
 public:
     void Tick(const Settings& cfg, const Locator& loc, bool kbEnabled, bool mouseEnabled);
-    void UnlockMouseNow(const Locator& loc);
+
+    // 立即执行一次（不看 500ms 节流）。启动时 / 托盘 / 热键 / 检测到新锁都用它。
+    void UnlockNow(const Locator& loc, bool kbEnabled, bool mouseEnabled);
+
     size_t KeyKills() const { return keyKills_; }
     size_t MouseUnlocks() const { return mouseUnlocks_; }
     bool   KeyboardLockPresent() const { return kbPresent_; }
     bool   MouseHookPresent() const { return mousePresent_; }
+
+    // 外部通道是否不可靠（需要主程序改用进程内 UnhookWindowsHookEx）
+    bool   NeedInProc() const { return needInProc_; }
+    bool   HasLockHost() const { return lockHost_; }
+    std::wstring LastResult() const { return lastResult_; }
     std::wstring StatusText() const;
 
-    // 向某个进程里“安装鼠标钩子的线程”投递 WM_QUIT。
-    // 这是厂商自己的析构路径：线程收到 WM_QUIT -> 退出循环 -> UnhookWindowsHookEx。
-    static int QuitHookThreads(const Locator& loc, DWORD pid);
 private:
-    void RestoreCursor();
+    void KillKeyboardLocks(bool enabled);
+    // force=忽略模块缓存；waitMs=投递后等待线程退出的时间（0 表示不阻塞 UI）；
+    // verbose=无论状态变化都写日志
+    void AttemptMouse(const Locator& loc, bool force, DWORD waitMs, bool verbose);
+
     size_t keyKills_ = 0;
     size_t mouseUnlocks_ = 0;
+    size_t extTries_ = 0;
     bool kbPresent_ = false;
     bool mousePresent_ = false;
+    bool needInProc_ = false;
+    bool lockHost_ = false;
     uint64_t lastMouseTry_ = 0;
+    std::wstring lastResult_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -321,7 +354,8 @@ public:
     uint64_t HeartbeatAgeMs() const;
 
     void RequestUnlock();
-    void PushPolicy(const Settings& cfg, const std::vector<DWORD>& protect);
+    void PushPolicy(const Settings& cfg, const std::vector<DWORD>& protect,
+                    const std::wstring& vendorDir);
     void Beat();
     void RequestShutdown();
     void SetRemoteBase(uint32_t base) { remoteBase_ = base; }
@@ -345,7 +379,8 @@ public:
 
     void Ensure(DWORD pid);                 // 排队（去重）
     void RequestUnlockAll();
-    void PushPolicy(const Settings& cfg, const std::vector<DWORD>& protect);
+    void PushPolicy(const Settings& cfg, const std::vector<DWORD>& protect,
+                    const std::wstring& vendorDir);
     void BeatAll();
     void ShutdownAll();
 
@@ -358,13 +393,20 @@ public:
         DWORD pid = 0;
         bool alive = false;
         uint64_t hbAgeMs = 0;
-        LONG blockedTerm = 0, blockedClose = 0, gated = 0, unlockCalls = 0;
+        LONG blockedTerm = 0, blockedClose = 0, gated = 0, unlockCalls = 0, devBlocked = 0;
+        LONG inprocUnlocks = 0;
+        LONG ioctlBlocked = 0;
+        LONG deniedLaunch = 0;
     };
     std::vector<Stat> Snapshot();
 
     int InjectedCount() { return (int)injectedCount_; }
     int FailCount() { return (int)failCount_; }
     std::wstring LastError();
+    std::wstring LastBlockedName();
+
+    // 某个会话里 g_hHook 非空 = 鼠标确实被钩住了（比外部猜更可靠）
+    bool AnyMouseHook();
 
 private:
     static DWORD WINAPI ThreadProc(LPVOID self);
@@ -381,6 +423,7 @@ private:
 
     std::set<DWORD> queue_;
     std::map<DWORD, uint64_t> failedAt_;    // pid -> 上次失败时间（30s 退避）
+    std::map<DWORD, uint64_t> injectedAt_;  // pid -> 上次注入时间（防止反复注入堆线程）
     std::map<DWORD, IpcSession*> sessions_;
     std::map<DWORD, uint32_t> bases_;       // pid -> 载荷映射基址（卸载时释放）
     std::wstring dataDir_;
@@ -406,7 +449,7 @@ public:
     void ShowGate(const CtPendingCmd& cmd, int index);
     void HideGate();
     void UpdateGate();
-    bool GateVisible() const { return gateWnd_ != nullptr && IsWindowVisible(gateWnd_); }
+    bool GateVisible() const;
     int  GateIndex() const { return gateIndex_; }
 
     void ShowFakeBlack(bool on);
@@ -418,6 +461,7 @@ public:
     HWND GateWndRef() const { return gateWnd_; }
 
 private:
+    static Ui* s_self_;
     static LRESULT CALLBACK StatusProc(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK GateProc(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK BlackProc(HWND, UINT, WPARAM, LPARAM);
@@ -425,11 +469,15 @@ private:
     static Ui* SelfFrom(HWND h);
 
     void CreateStatus();
-    void LayoutStatus();
-    void RefreshStatus();
+    void BuildModel();
+    int  HitTest(int x, int y) const;
+    bool EnsureSurface(int w, int h);
+    void ReleaseSurface();
+    void PaintStatus();
+    void PaintGateSurface();
+
     void CreateGate();
-    void LayoutGate();
-    void SetStatusText(int idx, const std::wstring& text, COLORREF color);
+    int  GateHitTest(int x, int y) const;
 
     HWND msgWnd_ = nullptr;
     HWND statusWnd_ = nullptr;
@@ -437,30 +485,32 @@ private:
     HWND fakeBlack_ = nullptr;
     HHOOK kbHook_ = nullptr;
 
-    HWND hdr_ = nullptr;
-    HWND rowEnable_[CAP_COUNT]{};
-    HWND rowState_[CAP_COUNT]{};
-    HWND logBox_ = nullptr;
-    HWND btnRestore_ = nullptr, btnLog_ = nullptr, btnAbout_ = nullptr;
-
-    HWND gateText_ = nullptr, gateCount_ = nullptr;
-    HWND gateAllow_ = nullptr, gateDeny_ = nullptr, gateAll_ = nullptr;
-    int  gateIndex_ = -1;
-    uint64_t gateDeadline_ = 0;
-
     HICON iconNormal_ = nullptr;
     HICON iconAlert_ = nullptr;
     HICON iconSmall_ = nullptr;
-    HFONT fontUi_ = nullptr;
-    HFONT fontMono_ = nullptr;
-    HFONT fontBold_ = nullptr;
-    HBRUSH brushBg_ = nullptr;
-
-    int  updateTick_ = 0;
     bool trayAdded_ = false;
     bool statusVisible_ = false;
-    std::vector<std::wstring> gateLines_;
-    static Ui* s_self_;
+    int  updateTick_ = 0;
+    int  hot_ = -1;
+    int  gateHot_ = -1;
+
+    ui::Model  model_;
+    ui::Metrics metrics_;
+    float scale_ = 1.0f;
+
+    HDC     mem_ = nullptr;
+    HBITMAP memBmp_ = nullptr;
+    void*   memBits_ = nullptr;
+    int     memW_ = 0;
+    int     memH_ = 0;
+    int     margin_ = 16;
+
+    ui::GateModel gmodel_;
+    std::wstring sig_;
+    int  gateIndex_ = -1;
+    int  gateTick_ = 0;
+    std::wstring gateApp_;
+    std::wstring gateCmd_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -480,6 +530,8 @@ public:
     void OnTray(UINT msg);
     void ToggleCap(int cap);
     void RestoreAll(bool exitAfter);
+    void UnlockControlNow(bool announce);   // 立即抢回键鼠控制
+    void NetGuardTick(bool operational, uint64_t now);   // 网络限制的反制
     void DecideGate(int decision);
     void RequestRestoreHotkey();     // Ctrl+Alt+H：3 秒内两次才执行
 
@@ -509,6 +561,16 @@ private:
     uint64_t nextPolicy_ = 0;
     bool     policyDirty_ = true;
     uint64_t restoreConfirmUntil_ = 0;
+    uint64_t nextShield_ = 0;
+    uint64_t nextNet_ = 0;
+    uint64_t nextDriverStop_ = 0;
+    int      netKills_ = 0;
+    bool     driverStopLogged_ = false;
+    uint64_t nextInProc_ = 0;          // 进程内解锁请求节流
+    std::set<DWORD> shieldedPids_;
+    std::set<DWORD> lockHosts_;        // 上一轮看到的 HookLib 宿主（检测新锁）
+    size_t   lastSessionCount_ = 0;
+    uint64_t lastLockSeen_ = 0;
     DWORD    gatePid_ = 0;
     int      gateIdx_ = -1;
 };
@@ -516,7 +578,11 @@ private:
 // 全局访问
 App& A();
 
-// 探针模式（--probe）
-int RunProbe();
+// 探针模式
+int RunProbe();       // --probe：只读体检
+int RunNetProbe();    // --netprobe：网络受限的成因
+int RunUnlockOnce();  // --unlock：不带界面，一次性解除键鼠锁
+int RunUiPreview(const wchar_t* outDir);  // --uipreview：把自绘界面渲染成 PNG
+int RunWinList();                          // --winlist：列出所有可见窗口 + 广播判定
 
 } // namespace ct

@@ -18,6 +18,7 @@ static LONG     g_lastUnlock = 0;
 static LONG     g_lastPolicy = 0;
 static LONG     g_lastShutdown = 0;
 static ULONGLONG g_lastRescan = 0;
+static ULONGLONG g_lastGuard = 0;
 
 // ── HookLib 解析 ────────────────────────────────────────────────────────────
 bool ResolveHookLib() {
@@ -125,30 +126,54 @@ int QuitOwnHookThreads() {
 }
 
 // ── 解锁鼠标 ────────────────────────────────────────────────────────────────
-void DoUnlockMouse() {
+//  一条"解一次"的通道在两种情况下不够用：
+//    * 锁线程被我们投 WM_QUIT 之后，Student.exe 收到教师端指令又会重新起一条；
+//    * 目标进程在校验 g_hHook 之后又重新 SetWindowsHookEx。
+//  所以请求解锁后给一个"保持窗口"，在这段时间里反复检查、反复摘。
+static ULONGLONG g_holdUntil = 0;
+static ULONGLONG g_lastHold = 0;
+
+static int UnlockPass() {
     int n = 0;
     ResolveHookLib();
 
-    // 1) 直接摘掉全局钩子（我们在目标进程内，句柄有效）
+    // 1) 直接摘掉全局钩子 —— 我们在目标进程内，HHOOK 有效，不依赖线程配合
     HHOOK hk = ReadHookHandle();
     if (hk) {
-        if (UnhookWindowsHookEx(hk)) {
-            ClearHookHandle();
-            ++n;
-        }
+        if (UnhookWindowsHookEx(hk)) ++n;
+        // 不管 Unhook 成败都把全局变量清掉：否则 rep.mouseHook 永远是 1，
+        // 主程序会误以为一直锁着（也让下面这轮的判断失真）
+        ClearHookHandle();
     }
     // 2) 让锁线程退出 —— 它会走厂商自己的析构路径（Unhook + 置空 g_hHook）
     n += QuitOwnHookThreads();
 
-    if (g_shm && n > 0) {
+    // 3) 光标钳制（ClipCursor 是跨进程有效的）
+    ClipCursor(nullptr);
+
+    if (n > 0 && g_shm) {
+        ++g_shm->rep.inprocUnlocks;
         ++g_shm->rep.unlockCalls;
-        g_shm->rep.mouseHook = 0;
     }
+    return n;
+}
+
+void DoUnlockMouse() {
+    UnlockPass();
+    if (!g_shm) return;
+    LONG hold = g_shm->req.unlockHoldMs;
+    if (hold <= 0) hold = 1000;
+    if (hold > 10000) hold = 10000;
+    g_holdUntil = GetTickCount64() + static_cast<ULONGLONG>(hold);
+    g_lastHold = 0;
+    g_shm->rep.mouseHook = ReadHookHandle() ? 1 : 0;
 }
 
 void ApplyPolicy() {
     if (!g_shm) return;
-    if (g_shm->req.wantTerminateGuard || g_shm->req.wantCloseGuard || g_shm->req.wantCmdGate) {
+    // 以前漏了 wantNetGuard：只开网络守卫时一个 hook 都不装，等于没开。
+    if (g_shm->req.wantTerminateGuard || g_shm->req.wantCloseGuard ||
+        g_shm->req.wantCmdGate || g_shm->req.wantNetGuard) {
         Hooks_Install();
         Hooks_Rescan();
     }
@@ -184,13 +209,21 @@ DWORD WINAPI PayloadThread(LPVOID) {
         g_map = nullptr;
         return 1;
     }
-    if (!fresh && g_shm->magic == CT_IPC_MAGIC) {
+    ApplyPolicy();   // 用默认策略先把 hook 装上（尤其是设备守卫），不等主程序第一次下发
+
+    // 已经有一个"同版本"的载荷在跑：不要重置，否则会把它的计数和请求序号清掉
+    if (!fresh && g_shm->magic == CT_IPC_MAGIC && g_shm->version == CT_IPC_VERSION) {
         g_shm->rep.alive = 1;
         Beat();
         return 0;
     }
+    // 版本不同 = 上一次运行留下的旧载荷（CloudTrainer 被强杀过就会这样）。
+    // 直接接管这块映射：不清掉的话主程序永远读不到新字段，解锁指令也就发不进来。
 
     memset(g_shm, 0, sizeof(*g_shm));
+    // 新建映射时先默认“挡设备”：主程序的第一次策略下发会覆盖它。
+    // 反过来（默认 0 等主程序写）会留一个窗口期，网络限制刚好落进去。
+    g_shm->req.wantNetGuard = 1;
     g_shm->magic = CT_IPC_MAGIC;
     g_shm->version = CT_IPC_VERSION;
     g_shm->ownerPid = GetCurrentProcessId();
@@ -198,6 +231,7 @@ DWORD WINAPI PayloadThread(LPVOID) {
     for (int i = 0; i < CT_MAX_PENDING; ++i) g_shm->pending[i].state = CT_CMD_IDLE;
 
     ResolveHookLib();
+    WinGuard_Tick();
     Beat();
 
     for (;;) {
@@ -216,15 +250,33 @@ DWORD WINAPI PayloadThread(LPVOID) {
         }
 
         ULONGLONG now = GetTickCount64();
+
+        // 保持窗口内持续纠正：厂商会把钩子重新装上，这里每 150ms 复查一次
+        if (g_holdUntil) {
+            if (now >= g_holdUntil) {
+                g_holdUntil = 0;
+            } else if (now - g_lastHold >= 150) {
+                g_lastHold = now;
+                // 只在"钩子又被装回来"时才做完整解锁。UnlockPass 要枚举本进程所有
+                // 线程（Toolhelp 快照），每 150ms 无条件跑一遍是浪费。
+                if (ReadHookHandle()) UnlockPass();
+            }
+        }
+
         if (now - g_lastRescan > 2500) {
             g_lastRescan = now;
             ResolveHookLib();
             Hooks_Rescan();
         }
+        if (now - g_lastGuard > 400) {
+            g_lastGuard = now;
+            WinGuard_Tick();      // 广播窗口可能在任意时刻被重建，持续扫
+        }
 
         Sleep(40);
     }
 
+    WinGuard_Remove();
     Hooks_Remove();
     if (g_shm) {
         g_shm->rep.alive = 0;

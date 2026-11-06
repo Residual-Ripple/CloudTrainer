@@ -118,6 +118,16 @@ int main() {
              shm->rep.flags, shm->rep.patchCount, shm->rep.hookLibFound,
              shm->rep.gateCalls).c_str());
 
+    // [4b] 走一遍进程内解锁请求：宿主里没有 HookLib，应当安静地什么都不做
+    InterlockedIncrement(&shm->req.seqUnlock);
+    Sleep(300);
+    if (shm->rep.alive == 0) {
+        Say(L"[FAIL] 解锁请求把载荷弄挂了\n");
+        return 13;
+    }
+    Say(FmtW(L"[4b] 解锁请求后载荷仍存活（inprocUnlocks=%ld）\n",
+             shm->rep.inprocUnlocks).c_str());
+
     // [5] 触发宿主调用 CreateProcessW，验证 IAT hook + 命令闸门
     ULONGLONG now = GetTickCount64();
     shm->req.mainAliveLo = (LONG)(uint32_t)now;

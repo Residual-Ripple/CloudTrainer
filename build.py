@@ -64,7 +64,7 @@ LDFLAGS_COMMON = [
     "-Wl,--gc-sections",
 ]
 
-MAIN_LIBS = ["-luser32", "-lgdi32", "-lshell32", "-ladvapi32", "-lole32",
+MAIN_LIBS = ["-luser32", "-lgdi32", "-lgdiplus", "-lshell32", "-ladvapi32", "-lole32",
              "-lcomctl32", "-lpsapi", "-lshlwapi", "-lversion"]
 
 PAYLOAD_LIBS = ["-luser32", "-lpsapi", "-ladvapi32", "-lshell32"]

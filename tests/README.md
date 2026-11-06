@@ -13,11 +13,39 @@
   4. 检查厂商白名单被放行（`ERROR_FILE_NOT_FOUND`，不是 `ERROR_ACCESS_DENIED`）；
   5. 请求卸载，检查载荷退出且宿主存活。
 
-跑法：
+## 外部解锁（`run_unlock_test.py`）
+
+对应"后手启动无法解除控制"这条反馈。它编一个**同名的假 `HookLib.dll`**
+（导出 `Lock`，起一条 `GetMessage` 循环线程）和 `lockhost.exe`，然后调用
+`src/main/Unlock.cpp` 里产品真正在用的 `QuitThreads`：
+
+| 场景 | 期望 |
+|---|---|
+| 锁线程有消息队列（真机常态） | 定位到 1 条线程、`WM_QUIT` 投递成功、线程真的退出、宿主存活 |
+| 锁线程**没有**消息队列（反例） | 如实报告 `posted=0 / err=1444`，而不是静默当成功 |
+
+顺序刻意做成"先有锁，再解锁"，也就是用户遇到的后手启动。
+
+## 窗口守卫（`run_winguard_test.py`）
+
+对应"拖动时被立即移回左上角"这条反馈。`winguardhost.exe` 注册一个同名类
+`MultiRenderWindowClass` 的窗口，WndProc 仿照真品：`WM_NCCALCSIZE` 返回 0、
+`WM_MOVING` / `WM_WINDOWPOSCHANGING` 把位置钉回 `(0,0)`。
+
+测试先验证"注入前确实会被钉住"，再注入载荷让守卫子类化，然后从外部移两次：
+
+| 阶段 | 请求位置 | 期望 |
+|---|---|---|
+| 注入前 | (320,240) | 实际 (0,0) —— 证明前提成立 |
+| 注入后 | (300,200) | 实际 (300,200) |
+| 注入后 | (520,360) | 实际 (520,360) |
+
+## 跑法
 
 ```bash
 python build.py                 # 先出 dist/CloudTrainerPayload.dll
 python tests/run_inject_test.py
+python tests/run_unlock_test.py
 ```
 
 会跑两个场景：

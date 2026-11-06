@@ -21,7 +21,7 @@
 #define CT_EVENT_NAME_FMT  L"Local\\CloudTrainer.Ready.%lu"
 
 #define CT_IPC_MAGIC   0x43544D31u   /* 'CTM1' */
-#define CT_IPC_VERSION 1
+#define CT_IPC_VERSION 3
 
 /* rep.flags 位 */
 #define CT_FLAG_INJECTED    0x00000001
@@ -59,8 +59,10 @@ typedef struct CtReq {
     volatile LONG protectPids[CT_MAX_PROTECT_PIDS];
     volatile LONG unlockHoldMs;     /* 解锁后保持多久（对抗重新上锁），默认 3000 */
     volatile LONG protectAllUserApps; /* 1 = 拦截对“任意非厂商用户程序”的结束请求（G5） */
+    volatile LONG wantNetGuard;       /* 1 = 拒绝打开 \\.\Inspect 设备（挡住网络限制） */
     volatile LONG mainAliveLo;      /* 主程序心跳（GetTickCount64），用于超时失败放行 */
     volatile LONG mainAliveHi;
+    wchar_t       vendorDir[260];   /* 厂商安装目录：此目录下的一切进程一律放行（广播流水线） */
 } CtReq;
 
 /* 载荷 -> 主程序 */
@@ -75,8 +77,14 @@ typedef struct CtRep {
     volatile LONG blockedClose;
     volatile LONG gatedCmd;
     volatile LONG unlockCalls;
+    volatile LONG inprocUnlocks;    /* 进程内 UnhookWindowsHookEx 成功次数 */
     volatile LONG patchCount;       /* 已打补丁的 IAT 槽位数 */
     volatile LONG gateCalls;        /* 进入命令闸门的次数（诊断用） */
+    volatile LONG devBlocked;       /* 被拒绝的 \\.\Inspect 打开次数 */
+    volatile LONG ioctlBlocked;     /* 被拒绝的、针对该设备的 DeviceIoControl 次数 */
+    volatile LONG deniedLaunch;     /* 直接拒绝启动的次数（网络限制执行器） */
+    volatile LONG unknownKills;     /* 拿不到目标 pid 的结束请求（G5 的盲区计数） */
+    wchar_t       lastTermName[64]; /* 最近一次被拦下的目标进程名 */
     volatile LONG lastError;
 } CtRep;
 

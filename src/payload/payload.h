@@ -39,6 +39,10 @@ void  DoUnlockMouse(void);
 int   QuitOwnHookThreads(void);
 void  ApplyPolicy(void);
 
+// ── winguard.cpp ────────────────────────────────────────────────────────────
+void WinGuard_Tick();
+void WinGuard_Remove();
+
 // ── hooks.cpp ───────────────────────────────────────────────────────────────
 void Hooks_Install(void);
 void Hooks_Remove(void);

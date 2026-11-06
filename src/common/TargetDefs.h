@@ -32,8 +32,20 @@ inline constexpr uint32_t kHookLibRvaHookThread = 0x1420;   // 锁线程入口�
 inline constexpr uint32_t kHookLibRvaGHook      = 0x1A1B4;  // 全局 HHOOK
 
 // ── 窗口类 ─────────────────────────────────────────────────────────────────
+// 2026-11-07 实机窗口快照（广播进行中）：类名 MultiRenderWindowClass，
+// 1920x1080 @ (0,0)，style=0x94000000（WS_POPUP|WS_VISIBLE|WS_CLIPSIBLINGS，
+// 运行时把 WS_CAPTION/WS_THICKFRAME 去掉了），ex=0x8（WS_EX_TOPMOST 是后加的）。
 inline constexpr wchar_t kClsBroadcast[]  = L"MultiRenderWindowClass";
 inline constexpr wchar_t kClsBlackScreen[] = L"DMTWnd";
+
+// 只认一个类名太脆：换版本就是白屏。按优先级匹配，越靠前越可信。
+inline constexpr const wchar_t* kClsBroadcastAliases[] = {
+    L"MultiRenderWindowClass",
+    L"MultiRenderWindow",
+    L"McmRenderWindowClass",
+    L"MultiWindowsRender",
+    nullptr,
+};
 
 // ── 命名事件（注意：全产品用 Event 而不是 Mutex） ───────────────────────────
 inline constexpr wchar_t kEvtStudentRunning[] = L"StudentRunning";
@@ -64,7 +76,10 @@ inline constexpr const wchar_t* kVendorExeWhitelist[] = {
     L"MmcFtpServer.exe", L"ScreenMonitor.exe", L"Loader.exe", L"ProcessProtect.exe",
     L"Student.exe", L"Teacher.exe", L"Startup.exe", L"UnInstall.exe", L"uninst.exe",
     L"remotesetting.exe", L"locationsetting.exe", L"DeviceControl_x86.exe",
-    L"DeviceControl_x64.exe", L"mmcLimitConsole_x86.exe", L"mmcLimitConsole_x64.exe",
+    L"DeviceControl_x64.exe",
+    // ★ 注意：mmcLimitConsole_x86/x64.exe 故意不列在这里。
+    //   它是「网络使用限制」的执行器（Student.exe 的启动名单里有它），
+    //   列进白名单等于放行断网。让它走命令闸门，由用户裁决。
     L"CSimulateMouse.exe", L"MacRender.exe", L"Group.exe", L"ecr_http.exe",
     L"VdiChannel.exe", L"typeeasy.exe", L"AdmPluginRequestServerConsole.exe",
     L"transfer_console.exe",
@@ -72,6 +87,41 @@ inline constexpr const wchar_t* kVendorExeWhitelist[] = {
     L"InlineHook.dll",
     nullptr,   // ★ 哨兵：遍历时必须用这个终止，不要用 sizeof 推长度
 };
+
+// ── 明确禁止启动的厂商程序 ──────────────────────────────────────────────────
+// 这些不是“可疑命令”，而是**网络使用限制的执行器**。命中就立刻拒绝，
+// 不走裁决 —— 让用户去点一个 20 秒的弹窗，本身就是不稳定的来源。
+inline constexpr const wchar_t* kVendorDenyExe[] = {
+    L"mmcLimitConsole_x86.exe",
+    L"mmcLimitConsole_x64.exe",
+    L"mmcLimitConsole.exe",
+    nullptr,
+};
+
+// ── 广播流水线（一律放行，绝不询问、绝不保护性拦截） ────────────────────────
+// 名单之外的兜底规则在载荷里：只要路径在安装目录下就放行。
+inline constexpr const wchar_t* kBroadcastPipeline[] = {
+    L"MultiRender.exe", L"Multi.exe", L"McmRender.exe", L"MultiWindowsRender.exe",
+    L"ScreenMonitor.exe", L"ScreenSender.exe", L"MacRender.exe", L"AudioRender.exe",
+    nullptr,
+};
+
+// ── 需要注入的“管理类”进程 ──────────────────────────────────────────────────
+// 这些进程都导入了 CreateToolhelp32Snapshot + OpenProcess + TerminateProcess，
+// 也就是说“程序使用限制”（上课时清理非白名单进程）可能由其中任意一个执行，
+// 不只是 Student.exe。实测里出现“广播一开始别的程序全没了”，就是这一族干的。
+inline constexpr const wchar_t* kVendorGuardExe[] = {
+    L"Student.exe", L"ProcessProtect.exe", L"Loader.exe", L"Multi.exe",
+    // 网络限制执行器也注入：万一没杀掉（权限不足/被看护拉起），
+    // 至少它的 DeviceIoControl 会被我们的 hook 挡住。
+    L"mmcLimitConsole_x86.exe", L"mmcLimitConsole_x64.exe", L"mmcLimitConsole.exe",
+    nullptr,
+};
+
+// ── 网络限制用的设备 ────────────────────────────────────────────────────────
+// Student.exe 里有 "\\.\Inspect" 这个打开串，对应 inspect.sys（WFP 重定向样例）。
+// “网络使用限制”就是通过它下发过滤器；把它挡住比事后删防火墙规则干净得多。
+inline constexpr wchar_t kInspectDevice[] = L"\\\\.\\Inspect";
 
 // ── 指纹（file size + PE TimeDateStamp） ────────────────────────────────────
 struct Fingerprint {

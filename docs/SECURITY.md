@@ -15,6 +15,7 @@
 | 网络 | **完全不联网**。不更新、不统计、不上报、不下载 |
 | 自启动 | **不注册**。没有 Run 键、没有计划任务、没有服务 |
 | 卸载 | 删除 exe 与 `%LOCALAPPDATA%\CloudTrainer\` 即可。运行期改动见第 4 节 |
+| 自我保护 | 给**本进程对象**加一条 DACL：`DENY 当前用户 PROCESS_TERMINATE`。只影响别人杀我们，不影响自己退出；不改系统策略、不装驱动、不注册服务 |
 
 ---
 
@@ -99,6 +100,20 @@ VirtualAllocEx(15 字节调用桩) → CreateRemoteThread(桩)
 不执行任何代码、不持有任何句柄。强行 `VirtualFreeEx` 有把目标进程打崩的风险，所以不做。
 
 ---
+
+## 4.5 自我保护到底做了什么
+
+```cpp
+GetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT, ...)   // 取现有 DACL
+SetEntriesInAclW(DENY, 当前用户 SID, PROCESS_TERMINATE, ...)  // 追加一条拒绝
+SetSecurityInfo(GetCurrentProcess(), ...)                     // 写回
+```
+
+- **挡得住**：以同一用户身份跑的 `TerminateProcess` / `taskkill /f` / 任务管理器结束任务
+  —— 它们都需要 `PROCESS_TERMINATE`，会拿到 `ACCESS_DENIED`。
+- **挡不住**：SYSTEM 权限的杀进程、驱动层强制结束、Job Object 的 `KILL_ON_JOB_CLOSE`。
+- **副作用**：任务管理器里"结束任务"会失败。这是我们想要的，但要知道。
+- **可关闭**：`selfProtect=0`。
 
 ## 5. 数据流
 
